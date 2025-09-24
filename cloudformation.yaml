@@ -235,7 +235,8 @@ Resources:
             Resource: !Sub "${StaticBucket.Arn}/*"
             Condition:
               StringEquals:
-                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+                AWS:SourceArn:
+                  Fn::Sub: "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
 
 Outputs:
   WebsiteBucket:
