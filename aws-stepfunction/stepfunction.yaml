@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Step Function State Machine CloudFormation Template
+
+Resources:
+  MyStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: StepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - sns:Publish
+                  - sqs:SendMessage
+                  - s3:PutObject
+                  - s3:GetObject
+                  - dynamodb:PutItem
+                Resource: "*"
+
+  MyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - dynamodb:PutItem
+                Resource: "*"
+
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "mystepfunctionstack-bucket-${AWS::AccountId}"
+
+  MyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-table"
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  MyLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-lambda"
+      Handler: index.handler
+      Role: !GetAtt MyLambdaRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              dynamodb = boto3.client('dynamodb')
+              bucket = event['bucket']
+              key = event['key']
+              table = event['table']
+              # Get file from S3
+              obj = s3.get_object(Bucket=bucket, Key=key)
+              content = obj['Body'].read().decode('utf-8')
+              # Save result in DynamoDB
+              dynamodb.put_item(
+                  TableName=table,
+                  Item={
+                      'id': {'S': key},
+                      'content': {'S': content}
+                  }
+              )
+              return {'status': 'success', 'id': key}
+
+  MyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: MySampleStateMachine
+      RoleArn: !GetAtt MyStateMachineRole.Arn
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "S3 -> Lambda -> DynamoDB Step Function",
+            "StartAt": "CreateS3Object",
+            "States": {
+              "CreateS3Object": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                "Parameters": {
+                  "Bucket": "${MyBucket}",
+                  "Key": "sample.txt",
+                  "Body": "Hello from Step Functions!"
+                },
+                "Next": "HandleFileInLambda"
+              },
+              "HandleFileInLambda": {
+                "Type": "Task",
+                "Resource": "${MyLambdaFunction.Arn}",
+                "Parameters": {
+                  "bucket": "${MyBucket}",
+                  "key": "sample.txt",
+                  "table": "${MyTable}"
+                },
+                "End": true
+              }
+            }
+          }
+      StateMachineType: STANDARD
+
+Outputs:
+  StateMachineArn:
+    Description: "ARN of the created Step Function State Machine"
+    Value: !Ref MyStateMachine
+  S3BucketName:
+    Description: "Name of the created S3 bucket"
+    Value: !Ref MyBucket
+  DynamoDBTableName:
+    Description: "Name of the created DynamoDB table"
+    Value: !Ref MyTable
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt MyLambdaFunction.Arn
