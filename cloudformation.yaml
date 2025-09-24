@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Minimal CloudFront + (optional WAF) + HTTP API + Lambda + DynamoDB + S3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: rcp-mini
+  PriceClass:
+    Type: String
+    Default: PriceClass_200
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+  CreateWAF:
+    Type: String
+    Default: 'false'       
+    AllowedValues: ['true','false']
+
+Conditions:
+  UseWAF: !Equals [!Ref CreateWAF, 'true']
+
+Resources:
+  # S3 static (private) + policy for CF
+  StaticBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-static-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerPreferred }]
+      VersioningConfiguration:
+        Status: Enabled
+
+  # DynamoDB
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-items
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # Lambda + role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+                Resource: !GetAtt AppTable.Arn
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-lambda
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      Environment:
+        Variables: { TABLE_NAME: !Ref AppTable }
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          ddb = boto3.client('dynamodb')
+          TABLE = os.environ['TABLE_NAME']
+          def _resp(s,b):
+              return {"statusCode":s,"headers":{"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Headers":"*","Access-Control-Allow-Methods":"GET,POST,OPTIONS"},"body":json.dumps(b)}
+          def handler(event, context):
+              http = event.get("requestContext",{}).get("http",{})
+              route = http.get("path","/")
+              method = http.get("method","GET")
+              if method=="OPTIONS": return _resp(200,{"ok":True})
+              if route=="/hello" and method=="GET":
+                  return _resp(200,{"message":"Hello from Lambda!"})
+              if route=="/item" and method=="POST":
+                  body = json.loads(event.get("body") or "{}")
+                  item_id = str(uuid.uuid4())
+                  ddb.put_item(TableName=TABLE, Item={"id":{"S":item_id},"value":{"S":str(body.get("value",""))}})
+                  return _resp(200,{"saved":True,"id":item_id})
+              if route=="/items" and method=="GET":
+                  r = ddb.scan(TableName=TABLE, Limit=25)
+                  items = [{"id":i["id"]["S"],"value":i["value"]["S"]} for i in r.get("Items",[])]
+                  return _resp(200,{"items":items})
+              return _resp(404,{"error":"Not found"})
+
+  # API Gateway HTTP API → Lambda
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET","POST","OPTIONS"]
+        AllowHeaders: ["*"]
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AppFunction.Arn}/invocations
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 5000
+
+  RouteHello:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /hello
+      Target: !Sub integrations/${LambdaIntegration}
+
+  RoutePostItem:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /item
+      Target: !Sub integrations/${LambdaIntegration}
+
+  RouteListItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /items
+      Target: !Sub integrations/${LambdaIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: prod
+      AutoDeploy: true
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AppFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*
+
+  # WAF (CLOUDFRONT → us-east-1)
+  WebACL:
+    Condition: UseWAF
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${ProjectName}-webacl
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${ProjectName}-webacl
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSCommon
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          OverrideAction: { None: {} }
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${ProjectName}-awscommon
+            SampledRequestsEnabled: true
+
+  # CloudFront + OAC
+  CfOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${ProjectName}-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        Description: OAC for private S3 origin
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${ProjectName} static site
+        DefaultRootObject: index.html
+        Origins:
+          - Id: s3Origin
+            DomainName: !GetAtt StaticBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt CfOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+        PriceClass: !Ref PriceClass
+        HttpVersion: http2
+        IPV6Enabled: true
+        WebACLId: !If [UseWAF, !GetAtt WebACL.Arn, !Ref "AWS::NoValue"]
+
+  StaticBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCFReadViaOAC
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${StaticBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+Outputs:
+  WebsiteBucket:
+    Description: S3 bucket for static site
+    Value: !Ref StaticBucket
+  CloudFrontURL:
+    Description: CloudFront URL
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+  ApiInvokeURL:
+    Description: API base URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+  TableName:
+    Description: DynamoDB table
+    Value: !Ref AppTable
