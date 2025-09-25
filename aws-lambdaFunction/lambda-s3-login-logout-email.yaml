@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: S3 static website + API Gateway + Lambda login (send SES email on success)
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: lambda-s3-login-bucket
+    Description: S3 bucket name for static website (must be globally unique)
+
+Resources:
+  # ---------------------- S3 BUCKET (public website) ----------------------
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${S3Bucket.Arn}/*"
+
+  # ---------------------- LAMBDA ROLE ----------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicAndSES
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+
+  # ---------------------- LAMBDA FUNCTION ----------------------
+  S3LoginLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LoginFunction
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const HEADERS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type',
+              'Access-Control-Allow-Methods': 'POST, GET, OPTIONS'
+            };
+
+            const ok  = (body) => ({ statusCode: 200, headers: HEADERS, body: JSON.stringify(body) });
+            const err = (code, body) => ({ statusCode: code, headers: HEADERS, body: JSON.stringify(body) });
+
+            try {
+              // Parse body safely
+              let username, password;
+              if (event && typeof event.body === 'string' && event.body.length) {
+                try {
+                  const body = JSON.parse(event.body);
+                  username = body.username; password = body.password;
+                } catch (e) {
+                  console.error('Bad JSON body:', e);
+                  return err(400, { success:false, message:'Bad JSON body' });
+                }
+              } else if (event && event.username && event.password) {
+                username = event.username; password = event.password;
+              } else {
+                return err(400, { success:false, message:'Missing username/password' });
+              }
+
+              // Demo credentials
+              const REAL_USER = 'admin';
+              const REAL_PASS = '1';
+
+              if (username === REAL_USER && password === REAL_PASS) {
+                // Send email via SES but do not fail login if email fails
+                try {
+                  const AWS = require('aws-sdk');
+                  const ses = new AWS.SES({ region: process.env.AWS_REGION || 'us-east-1' });
+                  const params = {
+                    Source: 'lehongduc201204@gmail.com',
+                    Destination: { ToAddresses: ['lehongduc201204@gmail.com'] },
+                    Message: {
+                      Subject: { Data: `Login success: ${username}` },
+                      Body: { Text: { Data: `User ${username} logged in at ${new Date().toISOString()} (UTC)` } }
+                    }
+                  };
+                  await ses.sendEmail(params).promise();
+                  console.log('SES email sent.');
+                } catch (e) {
+                  console.error('SES sendEmail error (ignored):', e && e.message);
+                }
+
+                return ok({ success:true, message:'Login success! Dang nhap thanh cong!', user: username });
+              }
+
+              return err(401, { success:false, message:'Invalid credentials!' });
+
+            } catch (e) {
+              console.error('Handler error:', e);
+              return err(500, { success:false, message:'Internal server error', error: String(e) });
+            }
+          };
+
+  # ---------------------- API GATEWAY ----------------------
+  LoginApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: LoginAPI
+      EndpointConfiguration: { Types: [REGIONAL] }
+
+  LoginResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref LoginApi
+      ParentId: !GetAtt LoginApi.RootResourceId
+      PathPart: login
+
+  LoginMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref LoginApi
+      ResourceId: !Ref LoginResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${S3LoginLambdaFunction.Arn}/invocations"
+
+  LoginOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref LoginApi
+      ResourceId: !Ref LoginResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+            ResponseTemplates:
+              application/json: ""
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [LoginMethod, LoginOptionsMethod]
+    Properties:
+      RestApiId: !Ref LoginApi
+      StageName: prod
+
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3LoginLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${LoginApi}/*/POST/login"
+
+# ---------------------- OUTPUTS ----------------------
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL for login
+    Value: !Sub "https://${LoginApi}.execute-api.${AWS::Region}.amazonaws.com/prod/login"
+  S3WebsiteURL:
+    Description: URL for website hosted on S3
+    Value: !GetAtt S3Bucket.WebsiteURL
