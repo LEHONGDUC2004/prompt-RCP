@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo Translate Site</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.6}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+    button{padding:8px 14px;border-radius:10px;border:1px solid #ccc;cursor:pointer}
+    button:disabled{opacity:.6;cursor:progress}
+    .status{font-size:14px;opacity:.8}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Xin chào! Đây là trang demo</h1>
+    <div>
+      <button id="btnVi">VI</button>
+      <button id="btnEn" title="Translate to English">EN</button>
+    </div>
+  </header>
+
+  <p>
+    Trang này là ví dụ: nội dung tiếng Việt sẽ được dịch sang tiếng Anh khi bạn nhấn nút <strong>EN</strong>.
+  </p>
+
+  <section>
+    <h2>Nội dung</h2>
+    <ul>
+      <li>Dòng 1: Giới thiệu dự án</li>
+      <li>Dòng 2: Hướng dẫn sử dụng</li>
+      <li>Dòng 3: Ghi chú kỹ thuật</li>
+    </ul>
+  </section>
+
+  <p class="status" id="status"></p>
+
+  <script>
+    const API_URL = "https://lgtr53gj1k.execute-api.us-east-1.amazonaws.com/prod/translate";
+
+    const btnEn = document.getElementById('btnEn');
+    const btnVi = document.getElementById('btnVi');
+    const statusEl = document.getElementById('status');
+
+    // Lưu bản gốc để có thể "quay về VI"
+    const originalHTML = document.documentElement.cloneNode(true);
+
+    btnEn.addEventListener('click', async () => {
+      btnEn.disabled = true;
+      statusEl.textContent = "Translating to English…";
+      try {
+        const res = await fetch(API_URL, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ sourceKey: 'index.html', destKey: 'en/index.html' })
+        });
+        if (!res.ok) throw new Error('API error ' + res.status);
+        const data = await res.json();
+        const html = data.translatedHtml;
+
+        // Chỉ thay phần <body> để giữ lại <script> đang chạy
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        document.body.innerHTML = doc.body.innerHTML;
+
+        // Cập nhật lang
+        document.documentElement.setAttribute('lang', 'en');
+        statusEl.textContent = "Translated ✓";
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = "Translate failed: " + e.message;
+      } finally {
+        btnEn.disabled = false;
+      }
+    });
+
+    btnVi.addEventListener('click', () => {
+      // Khôi phục lại HTML gốc (VI)
+      document.documentElement.replaceWith(originalHTML.cloneNode(true));
+      // trang sẽ reload DOM → không cần gì thêm
+    });
+  </script>
+</body>
+</html>

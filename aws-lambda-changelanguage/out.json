@@ -1,0 +1,1 @@
+{"statusCode": 500, "headers": {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "OPTIONS,POST", "Access-Control-Allow-Headers": "Content-Type,Authorization"}, "body": "{\"error\": \"An error occurred (SubscriptionRequiredException) when calling the TranslateText operation: The AWS Access Key Id needs a subscription for the service\"}"}

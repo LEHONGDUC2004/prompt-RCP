@@ -11,7 +11,7 @@ Resources:
   # ---------------------- S3 BUCKET (public website) ----------------------
   S3Bucket:
     Type: AWS::S3::Bucket
-    Properties:
+    Properties: 
       BucketName: !Ref BucketName
       PublicAccessBlockConfiguration:
         BlockPublicAcls: false

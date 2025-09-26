@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Static S3 website + API Gateway + Lambda to translate HTML to English on button click
+
+Parameters:
+  SourceKey:
+    Type: String
+    Default: index.html
+  WriteTranslatedToS3:
+    Type: String
+    Default: false
+    AllowedValues: [true, false]
+  DestinationKey:
+    Type: String
+    Default: en/index.html
+  AllowPublicWebsite:
+    Type: String
+    Default: true
+    AllowedValues: [true, false]
+  CorsOrigin:
+    Type: String
+    Default: '*'
+
+Conditions:
+  AllowPublicPolicy: !Equals [!Ref AllowPublicWebsite, 'true']
+  IsPublic:          !Equals [!Ref AllowPublicWebsite, 'true']
+
+Resources:
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: !Ref SourceKey
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls:        !If [IsPublic, false, true]
+        BlockPublicPolicy:      !If [IsPublic, false, true]
+        IgnorePublicAcls:       !If [IsPublic, false, true]
+        RestrictPublicBuckets:  !If [IsPublic, false, true]
+
+  WebsitePolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: AllowPublicPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+        - PolicyName: S3ReadWriteSelective
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadSource
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${SiteBucket.Arn}/${SourceKey}
+              - Sid: OptionalWriteDest
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${SiteBucket.Arn}/${DestinationKey}
+        - PolicyName: TranslateAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: translate:TranslateText
+                Resource: '*'
+
+  TranslateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Handler: index.handler
+      Environment:
+        Variables:
+          SITE_BUCKET: !Ref SiteBucket
+          SOURCE_KEY: !Ref SourceKey
+          DEST_KEY: !Ref DestinationKey
+          WRITE_TO_S3: !Ref WriteTranslatedToS3
+          SOURCE_LANG: vi
+          TARGET_LANG: en
+          CORS_ORIGIN: !Ref CorsOrigin
+      Code:
+        ZipFile: |
+          import os, json, boto3, base64
+          from html.parser import HTMLParser
+          s3 = boto3.client('s3')
+          translate = boto3.client('translate')
+          BUCKET = os.environ['SITE_BUCKET']
+          SOURCE_KEY = os.environ['SOURCE_KEY']
+          DEST_KEY = os.environ['DEST_KEY']
+          TARGET_LANG = os.environ.get('TARGET_LANG', 'en')
+          SOURCE_LANG = os.environ.get('SOURCE_LANG', 'vi')
+          WRITE_TO_S3 = os.environ.get('WRITE_TO_S3','false').lower() == 'true'
+          CORS_ORIGIN = os.environ.get('CORS_ORIGIN','*')
+          class TranslatingHTMLParser(HTMLParser):
+              def __init__(self, translate_fn):
+                  super().__init__(convert_charrefs=False)
+                  self.out=[]; self.translate_fn=translate_fn
+              def handle_starttag(self, tag, attrs):
+                  parts=[f"<{tag}"]
+                  for k,v in attrs:
+                      parts.append(f" {k}" if v is None else f' {k}="{(v or "").replace("\"","&quot;")}"')
+                  parts.append(">"); self.out.append("".join(parts))
+              def handle_endtag(self, tag): self.out.append(f"</{tag}>")
+              def handle_startendtag(self, tag, attrs):
+                  parts=[f"<{tag}"]
+                  for k,v in attrs:
+                      parts.append(f" {k}" if v is None else f' {k}="{(v or "").replace("\"","&quot;")}"')
+                  parts.append(" />"); self.out.append("".join(parts))
+              def handle_data(self, data):
+                  if data.strip():
+                      for chunk in chunk_text(data, 4500):
+                          self.out.append(translate_text(chunk))
+                  else:
+                      self.out.append(data)
+              def handle_entityref(self, name): self.out.append(f"&{name};")
+              def handle_charref(self, name): self.out.append(f"&#{name};")
+              def handle_comment(self, data): self.out.append(f"<!--{data}-->")
+              def get_html(self): return "".join(self.out)
+          def chunk_text(s, max_bytes):
+              res, buf, cur = [], [], 0
+              for token in s.split(" "):
+                  add = token if cur==0 else " "+token
+                  new = "".join(buf)+add
+                  if len(new.encode("utf-8")) > max_bytes:
+                      if buf:
+                          res.append("".join(buf)); buf, cur = [token], len(token.encode("utf-8"))
+                      else:
+                          step=max(1,max_bytes//4)
+                          for i in range(0,len(token),step): res.append(token[i:i+step])
+                          buf, cur = [], 0
+                  else:
+                      buf.append(add if cur>0 else token); cur=len("".join(buf).encode("utf-8"))
+              if buf: res.append("".join(buf))
+              return res
+          def translate_text(text):
+              return translate.translate_text(
+                  Text=text,
+                  SourceLanguageCode=SOURCE_LANG, 
+                  TargetLanguageCode=TARGET_LANG
+              )['TranslatedText']
+
+          def translate_html(html):
+              p=TranslatingHTMLParser(translate_text); p.feed(html); return p.get_html()
+          def handler(event, context):
+              try:
+                  body={}
+                  if 'body' in event and event['body']:
+                      raw = base64.b64decode(event['body']).decode('utf-8') if event.get('isBase64Encoded') else event['body']
+                      try: body=json.loads(raw)
+                      except: body={}
+                  source_key = body.get('sourceKey', SOURCE_KEY)
+                  dest_key   = body.get('destKey', DEST_KEY)
+                  obj = s3.get_object(Bucket=BUCKET, Key=source_key)
+                  html = obj['Body'].read().decode('utf-8')
+                  translated = translate_html(html)
+                  if WRITE_TO_S3:
+                      s3.put_object(Bucket=BUCKET, Key=dest_key, Body=translated.encode('utf-8'),
+                                    ContentType='text/html; charset=utf-8')
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Access-Control-Allow-Origin": CORS_ORIGIN,
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type,Authorization"
+                      },
+                      "body": json.dumps({
+                          "translatedHtml": translated,
+                          "bucket": BUCKET,
+                          "sourceKey": source_key,
+                          "destKey": dest_key,
+                          "writtenToS3": WRITE_TO_S3
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Access-Control-Allow-Origin": CORS_ORIGIN,
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type,Authorization"
+                      },
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: TranslateSiteApi
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: translate
+
+  ApiMethodOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'${CorsOrigin}'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  ApiMethodPost:
+    Type: AWS::ApiGateway::Method
+    DependsOn: [TranslateFunction]
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FuncArn}/invocations
+          - { FuncArn: !GetAtt TranslateFunction.Arn }
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [ApiMethodPost, ApiMethodOptions]
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: prod
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TranslateFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/POST/translate
+
+Outputs:
+  WebsiteURL:
+    Description: S3 Static Website URL
+    Value: !Sub http://${SiteBucket}.s3-website-${AWS::Region}.amazonaws.com
+  ApiURL:
+    Description: API invoke URL (POST /translate)
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/translate
+  BucketName:
+    Value: !Ref SiteBucket
+  LambdaArn:
+    Value: !GetAtt TranslateFunction.Arn
